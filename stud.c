@@ -27,44 +27,7 @@
   *
   **/
 
-#include <sys/types.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <sys/wait.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <net/if.h>
-#include <arpa/inet.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <assert.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <getopt.h>
-#include <pwd.h>
-#include <limits.h>
-#include <syslog.h>
-#include <stdarg.h>
-
-#include <ctype.h>
-#include <sched.h>
-#include <signal.h>
-
-#include <openssl/ssl.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
-#include <openssl/x509.h>
-#include <openssl/err.h>
-#include <openssl/engine.h>
-#include <openssl/asn1.h>
-#include <ev.h>
-
-#include "ringbuffer.h"
-#include "shctx.h"
-#include "configuration.h"
+#include "stud.h"
 
 #ifndef MSG_NOSIGNAL
 # define MSG_NOSIGNAL 0
@@ -137,41 +100,6 @@ typedef struct ctx_list {
 static ctx_list *sni_ctxs;
 
 #endif /* OPENSSL_NO_TLSEXT */
-
-/*
- * Proxied State
- *
- * All state associated with one proxied connection
- */
-typedef struct proxystate {
-    ringbuffer ring_ssl2clear;          /* Pushing bytes from secure to clear stream */
-    ringbuffer ring_clear2ssl;          /* Pushing bytes from clear to secure stream */
-
-    ev_io ev_r_ssl;                     /* Secure stream write event */
-    ev_io ev_w_ssl;                     /* Secure stream read event */
-
-    ev_io ev_r_handshake;               /* Secure stream handshake write event */
-    ev_io ev_w_handshake;               /* Secure stream handshake read event */
-
-    ev_io ev_w_connect;                 /* Backend connect event */
-
-    ev_io ev_r_clear;                   /* Clear stream write event */
-    ev_io ev_w_clear;                   /* Clear stream read event */
-
-    ev_io ev_proxy;                     /* proxy read event */
-
-    int fd_up;                          /* Upstream (client) socket */
-    int fd_down;                        /* Downstream (backend) socket */
-
-    int want_shutdown:1;                /* Connection is half-shutdown */
-    int handshaked:1;                   /* Initial handshake happened */
-    int clear_connected:1;              /* Clear stream is connected  */
-    int renegotiation:1;                /* Renegotation is occuring */
-
-    SSL *ssl;                           /* OpenSSL SSL state */
-
-    struct sockaddr_storage remote_ip;  /* Remote ip returned from `accept` */
-} proxystate;
 
 #define LOG(...)                                            \
     do {                                                    \
@@ -892,6 +820,17 @@ static void shutdown_proxy(proxystate *ps, SHUTDOWN_REQUESTOR req) {
         SSL_set_shutdown(ps->ssl, SSL_SENT_SHUTDOWN);
         SSL_free(ps->ssl);
 
+#ifdef PROTO_HTTP
+        free(ps->ph.parser);
+
+        /* free all malloc'd fields and values */
+        for (int i = 0; i < ps->ph.nlines; i++) {
+          free(ps->ph.header[i].field);
+          free(ps->ph.header[i].value);
+        }
+        free(ps->ph.uri);
+#endif
+
         free(ps);
     }
     else {
@@ -1222,12 +1161,17 @@ static void handle_fatal_ssl_error(proxystate *ps, int err, int backend) {
 static void ssl_read(struct ev_loop *loop, ev_io *w, int revents) {
     (void) revents;
     int t;
+    int length_written = 0;
     proxystate *ps = (proxystate *)w->data;
     if (ps->want_shutdown) {
         ev_io_stop(loop, &ps->ev_r_ssl);
         return;
     }
+#ifdef PROTO_HTTP
+    char buf[RING_DATA_LEN] = {0};
+#else
     char * buf = ringbuffer_write_ptr(&ps->ring_ssl2clear);
+#endif
     t = SSL_read(ps->ssl, buf, RING_DATA_LEN);
 
     /* Fix CVE-2009-3555. Disable reneg if started by client. */
@@ -1236,8 +1180,63 @@ static void ssl_read(struct ev_loop *loop, ev_io *w, int revents) {
         return;
     }
 
+/* Goals:
+         • Read from SSL into buffer
+         • Pass into http_parser_execute
+         • Get callbacks for headers/values/headers_done
+           • Store first line (method, url, version)
+           • Store headers & values in a new growing buffer
+           • remove x-forwarded-for and x-forwarded-proto
+           • when headers done
+             • inject x-forwarded-for and x-forwarded-proto
+           * re-combine METHOD URI HTTP/1.1
+                        HEADERS...
+                        BODY
+           • write init line and headers into ring buffer
+           • slurp rest of body
+           • write body into ring buffer
+    */
+
     if (t > 0) {
-        ringbuffer_write_append(&ps->ring_ssl2clear, t);
+#ifdef PROTO_HTTP
+        int nparsed = http_parser_execute(ps->ph.parser,
+                        &ps->ph.settings, buf, t);
+        if (nparsed != t) {
+          return;  /* PARSING ERROR */
+        }
+
+        if (!ps->ph.done_parsing_http) {
+          return;
+        }
+
+        const char *method = http_method_str(ps->ph.method);
+        char *URI = ps->ph.uri;
+        char full_method[4096] = {0};
+        int method_sz;
+        method_sz = snprintf(full_method, 4096, "%s %s HTTP/1.1\n",method, URI);
+        if (method_sz >= 4096) {
+          return; /* header too long.  handle error better */
+        }
+        char *headers = assemble_headers(ps);
+        int header_len = strlen(headers);
+
+        char *body = ps->ph.body;
+        int body_len = ps->ph.body_sz;
+
+        char *ringbuf = ringbuffer_write_ptr(&ps->ring_ssl2clear);
+        memcpy(ringbuf, full_method, method_sz);
+        length_written += method_sz;
+        memcpy(ringbuf + length_written, headers, header_len);
+        length_written += header_len;
+        memcpy(ringbuf + length_written, body, body_len);
+        length_written += body_len;
+
+        free(headers);
+        free(body);
+#else
+        length_written = t;
+#endif
+        ringbuffer_write_append(&ps->ring_ssl2clear, length_written);
         if (ringbuffer_is_full(&ps->ring_ssl2clear))
             ev_io_stop(loop, &ps->ev_r_ssl);
         if (ps->clear_connected)
@@ -1362,6 +1361,35 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
     ps->handshaked = 0;
     ps->renegotiation = 0;
     ps->remote_ip = addr;
+
+#ifdef PROTO_HTTP
+    ps->ph.nlines = 0;  /* auto-incremented to one on first header field */
+    ps->ph.body = NULL;
+    ps->ph.body_sz = 0;
+    ps->ph.stripped_last_header = 0;
+    ps->ph.settings.on_message_begin = NULL;
+    ps->ph.settings.on_path = NULL;
+    ps->ph.settings.on_query_string = NULL;
+    ps->ph.settings.on_message_complete = on_message_complete;
+    ps->ph.settings.on_url = cb_url;
+    ps->ph.settings.on_header_field = on_header_field;
+    ps->ph.settings.on_header_value = on_header_value;
+    ps->ph.settings.on_headers_complete = cb_headers_complete;
+    ps->ph.settings.on_body = on_body;
+    ps->ph.parser = malloc(sizeof(*(ps->ph.parser)));
+    ps->ph.uri = NULL;
+    ps->ph.done_parsing_http = 0;
+    ps->ph.parser->data = ps;
+    ps->ph.last_was_value = 1; /* start with last_was_value so Field is read */
+
+    http_parser_init(ps->ph.parser, HTTP_REQUEST);
+
+    for (int i = 0; i < MAX_HEADER_LINES; i++) {
+      ps->ph.header[i].field = NULL;
+      ps->ph.header[i].value = NULL;
+    }
+#endif
+
     ringbuffer_init(&ps->ring_clear2ssl);
     ringbuffer_init(&ps->ring_ssl2clear);
 

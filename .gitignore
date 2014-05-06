@@ -4,3 +4,4 @@ core
 core.*
 *.o
 stud
+http-parser

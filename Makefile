@@ -33,8 +33,23 @@ ifneq ($(NO_CONFIG_FILE),)
 CFLAGS += -DNO_CONFIG_FILE
 endif
 
+# X-Forwarded-{For,Proto} support?
+ifneq ($(USE_HTTP_HEADERS),)
+CFLAGS += -DPROTO_HTTP
+OBJS   += proto_http.o http-parser/http_parser.o
+endif
+
 ALL += stud
 realall: $(ALL)
+
+$(OBJS): http-parser
+
+http-parser:
+	git clone https://github.com/joyent/http-parser.git
+	cd http-parser && git checkout -q 1786fdae36d3d40d59463dacab1cfb4165cf9f1d
+
+http-parser/http_parser.o: http-parser
+	make -C http-parser http_parser.o
 
 stud: $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
