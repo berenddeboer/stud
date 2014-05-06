@@ -37,10 +37,6 @@ endif
 ifneq ($(USE_HTTP_HEADERS),)
 CFLAGS += -DPROTO_HTTP
 OBJS   += proto_http.o http-parser/http_parser.o
-endif
-
-ALL += stud
-realall: $(ALL)
 
 $(OBJS): http-parser
 
@@ -50,6 +46,12 @@ http-parser:
 
 http-parser/http_parser.o: http-parser
 	make -C http-parser http_parser.o
+
+endif
+
+ALL += stud
+realall: $(ALL)
+
 
 stud: $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -62,6 +64,5 @@ install: $(ALL)
 
 clean:
 	rm -f stud $(OBJS)
-
 
 .PHONY: all realall
