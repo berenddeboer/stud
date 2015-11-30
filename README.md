@@ -51,6 +51,13 @@ Please be aware of the policy regarding releases, code stability, and security:
    complex) binary.  Therefore, the deeply paranoid are advised to use
    only the standard `stud` binary at the cost of some performance.
 
+About this release
+------------------
+This branch is based on lbogdan/stud so includes proper SNI wildcard handling.
+It adds a fix so TLS 1.2 works with SSLv3 disabled.
+You now get a perfect score at ssllabs!
+
+
 Requirements and Limitations
 ----------------------------
 
