@@ -1,3 +1,13 @@
+OBSOLETE, PLEASE USE HITCH
+==========================
+Shortly after I started adding patches that floated around on the internet, I
+discovered hitch, that's a fully maintained successor of stud. Please use that:
+
+  https://github.com/varnish/hitch
+
+It's created by Varnish Sofftware.
+
+
 stud - The Scalable TLS Unwrapping Daemon
 =========================================
 
@@ -53,6 +63,8 @@ Please be aware of the policy regarding releases, code stability, and security:
 
 About this release
 ------------------
+NOTE: this source is obsolete, please use hitch: https://github.com/varnish/hitch
+
 This branch is based on lbogdan/stud so includes proper SNI wildcard handling.
 It adds a fix so TLS 1.2 works with SSLv3 disabled.
 You now get a perfect score at ssllabs!
